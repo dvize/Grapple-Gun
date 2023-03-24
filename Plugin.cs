@@ -1,25 +1,20 @@
 ﻿using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Configuration;
 using Comfort.Common;
-using UnityEngine;
-using Newtonsoft.Json;
 using EFT;
-using System.IO;
-using System.Reflection;
-using System.Threading.Tasks;
-using UnityEngine.Networking;
-using System.Collections.Generic;
-using System.Collections;
-using System.Security.AccessControl;
-using System.Linq;
-using Aki.Reflection.Patching;
 using EFT.UI;
+using UnityEngine;
+using UnityEngine.Networking;
 
 namespace GrappleGun
 {
 
-    [BepInPlugin("com.dvize.GrappleGun", "dvize.GrappleGun", "1.0.0")]
+    [BepInPlugin("com.dvize.GrappleGun", "dvize.GrappleGun", "1.1.0")]
     class GrappleGunPlugin : BaseUnityPlugin
     {
 
@@ -37,7 +32,15 @@ namespace GrappleGun
         {
             get; set;
         }
+        public static ConfigEntry<float> durationMultiplier
+        {
+            get; set;
+        }
         public static ConfigEntry<float> maxAcceleration
+        {
+            get; set;
+        }
+        public static ConfigEntry<float> distanceAboveHook
         {
             get; set;
         }
@@ -58,7 +61,7 @@ namespace GrappleGun
 
         public static AudioClip ShootGrappleGunClip;
         public static AudioClip DetachGrappleGunClip;
-        public static Vector3 startingPosition;
+        public static Vector3 spawnPosition;
         public async void Awake()
         {
             GrappleKey = Config.Bind(
@@ -70,8 +73,14 @@ namespace GrappleGun
             maxConnectionDistance = Config.Bind(
                 "Main Settings",
                 "maxConnectionDistance",
-                100f,
+                150f,
                 "Max Distance to Attach Hook");
+
+            durationMultiplier = Config.Bind(
+                "Main Settings",
+                "Duration Multiplier",
+                1f,
+                "Multiplies the hooking distance in calc so you hang time longer");
 
             maxSpeed = Config.Bind(
                 "Main Settings",
@@ -84,6 +93,12 @@ namespace GrappleGun
                 "maxAcceleration",
                 10f,
                 "Max Acceleration when using Hook");
+
+            distanceAboveHook = Config.Bind(
+                "Main Settings",
+                "Distance Above Hook Anchor",
+                22f,
+                "How far above hook you land");
 
             gravityVector = Config.Bind(
                 "Main Settings",
@@ -123,15 +138,19 @@ namespace GrappleGun
                         {
                             Logger.LogDebug("GG: Set all events");
                             player.OnPlayerDeadOrUnspawn += Player_OnPlayerDeadOrUnspawn;
-                            startingPosition = player.Transform.position;
+                            spawnPosition = player.Transform.position;
                             player.ActiveHealthController.FallSafeHeight = 999999f;
+                            isCoroutineRunning = false;
+                            isGrappling = false;
+                            firstTimeTriggered = false;
+                            canMove = true;
                             runOnceOnly = true;
                             toggleTimer = 0;
                         }
                         if (GrappleKey.Value.IsUp() && isGrappling)
                         {
                             Logger.LogDebug("GG: End Grapple Hook");
-                            StopGrapple(player);
+                            StopGrapple(player, player.Transform.position);
                             isGrappling = false;
                             firstTimeTriggered = false;
                             //fix gravity
@@ -151,8 +170,8 @@ namespace GrappleGun
                         }
                         if (emergencyResetPosition.Value == true)
                         {
-                            player.Transform.position = startingPosition;
-                            StopGrapple(player);
+                            StopGrapple(player, player.Transform.position);
+                            player.Transform.position = spawnPosition;
                             isGrappling = false;
                             firstTimeTriggered = false;
                             //fix gravity
@@ -193,7 +212,8 @@ namespace GrappleGun
         bool levelBorderCollided;
         bool objectCollided;
         bool canMove = true;
-        List<String> exclusionList = new List<string> {"body", "human", "root", "road", "terrain", "floor", "ballistic", "area", "rails", "tunel", "balistic"};
+        bool isCoroutineRunning;
+        List<String> exclusionList = new List<string> {"body", "human", "root", "road", "terrain", "floor", "ballistic", "area", "rails", "tunel", "balistic", "spawn", "around"};
         private void FixedUpdate()
         {
 
@@ -221,6 +241,7 @@ namespace GrappleGun
                         levelBorderCollided = false;
                         objectCollided = false;
 
+                        canMove = true;
 
                         //check each collider and try to eliminate false positive where you next to a collider but on the ground
                         foreach (Collider collider in myColliders)
@@ -241,52 +262,60 @@ namespace GrappleGun
                         if (objectCollided || levelBorderCollided)
                         {
                             //Logger.LogDebug("GG: Hitting an Object Collider" or "GG: Hitting the Level Border");
-                            StopGrapple(player);
-                            
+                            StopGrapple(player, player.Transform.position);
+
                             canMove = false;
                         }
                         else
                         {
-                            if (canMove)
+                            if (canMove && !isCoroutineRunning)
                             {
-                                // increase the current speed gradually until it reaches the maximum speed
-                                currentSpeed = Mathf.MoveTowards(currentSpeed, maxSpeed.Value, Time.deltaTime * maxAcceleration.Value);
-
-                                // update player position based on grapple direction and current speed
-                                Vector3 newPosition = player.Transform.position + grappleDirection.normalized * currentSpeed * Time.deltaTime;
-
-                                // Cast a sphere in the direction of movement to check for collisions
-                                float radius = playerCollider.radius;
-                                Vector3 castOffset = Vector3.up * (playerCollider.height * 0.5f - playerCollider.radius);
-                                bool hitWall = Physics.SphereCast(newPosition + castOffset, radius, grappleDirection.normalized, out RaycastHit hitInfo, maxDistance: 1.0f, ObjectLayer);
-
-                                if (hitWall)
-                                {
-                                    // Adjust the new position to be outside the wall
-                                    newPosition = hitInfo.point - grappleDirection.normalized * radius;
-                                    grapplingHookLine.SetPosition(0, newPosition);
-                                    player.Transform.position = newPosition;
-                                }
-
-                                // Apply the new position if it's not inside a wall
-                                if (!hitWall)
-                                {
-                                    player.Transform.position = newPosition;
-                                }
-
-                                // update Line Renderer end point
-                                grapplingHookLine.enabled = true;
-                                grapplingHookLine.SetPosition(1, grapplingHookPosition);
+                                // Start the coroutine only if it's not already running
+                                var startingPosition = player.Transform.position;
+                                StartCoroutine(MovePlayerAlongParabolicPath(player, grapplingHookPosition, startingPosition));
                             }
 
-                            canMove = true;
-                            
                         }
 
                     }    
                 }
             }
             catch { }
+        }
+        private IEnumerator MovePlayerAlongParabolicPath(Player player, Vector3 grapplingHookPosition, Vector3 startingPosition)
+        {
+            isCoroutineRunning = true;
+            float distance = Vector3.Distance(grapplingHookPosition, startingPosition);
+            float height = Mathf.Clamp(distance / 2f, 1f, GrappleGunPlugin.distanceAboveHook.Value);
+            Vector3 apex = grapplingHookPosition + (startingPosition - grapplingHookPosition) / 2f + Vector3.up * height;
+
+            float maxSpeed = GrappleGunPlugin.maxSpeed.Value;
+            float maxAcceleration = GrappleGunPlugin.maxAcceleration.Value;
+            float currentSpeed = 0f;
+
+            float timeNeeded = Mathf.Abs(maxSpeed - currentSpeed) / maxAcceleration;
+            float duration = (GrappleGunPlugin.durationMultiplier.Value * distance) / timeNeeded;
+            Logger.LogDebug("GrappleGun: Moving player along parabolic path for " + duration + " seconds");
+
+            float elapsedTime = 0f;
+            while (elapsedTime < duration)
+            {
+                currentSpeed = Mathf.MoveTowards(currentSpeed, maxSpeed, Time.fixedDeltaTime * maxAcceleration);
+                float timeRatio = elapsedTime / duration;
+                Vector3 newPositionOnPath = CalculatePositionOnParabolicPath(grapplingHookPosition, apex, startingPosition, timeRatio);
+                player.Transform.position = newPositionOnPath;
+                elapsedTime += Time.fixedDeltaTime;
+                yield return null;
+            }
+
+            //player.Transform.position = startingPosition;
+            StopGrapple(player, startingPosition);
+            //isCoroutineRunning = false;
+        }
+
+        private Vector3 CalculatePositionOnParabolicPath(Vector3 start, Vector3 apex, Vector3 end, float t)
+        {
+            return Mathf.Pow(1 - t, 2) * end + 2 * (1 - t) * t * apex + Mathf.Pow(t, 2) * start;
         }
 
         private void StartGrapple(Player player)
@@ -316,48 +345,35 @@ namespace GrappleGun
             }
         }
 
-        private void StopGrapple(Player player)
+        private void StopGrapple(Player player, Vector3 newPosition)
         {
-            // Destroy Line Renderer and reset isGrappling flag
-            Logger.LogDebug("GG: Stopping Grappling");
-            Destroy(grapplingHookLine.gameObject);
-            isGrappling = false;
-            firstTimeTriggered = false;
-            setLessGravity(player, false);
-        }
-        private void StopGrappleButNoDetach(Player player)
-        {
-            Logger.LogDebug("GG: Holding Position");
-            Destroy(grapplingHookLine.gameObject);
-            isGrappling = true;
-            setLessGravity(player, true);
+            try
+            {
+                // Destroy Line Renderer and reset isGrappling flag
+                Logger.LogDebug("GG: Stopping Grappling");
+                Destroy(grapplingHookLine.gameObject);
+                isGrappling = false;
+                firstTimeTriggered = false;
+                setLessGravity(player, false);
+                isCoroutineRunning = false;
+                canMove = true;
+            }
+            catch { }
+
         }
         private bool isOnGround(Player player){
 
             return player.MovementContext.IsGrounded;
-
-            /*//this method allows to grapple from on top objects but its janky
-            float raycastDistance = 5f;
-            RaycastHit2D hit = Physics2D.Raycast(player.Transform.position, Vector2.down, raycastDistance, ObjectLayer);
-
-            if (hit)
-            {
-                return true;
-            }
-
-            return false;*/
         }
         private void setLessGravity(Player player, bool choice)
         {
             if (choice)
             {
-                //player.MovementContext.CurrentState.DisableRootMotion = true;
-                Physics.gravity = gravityVector.Value;
+                var localSpace = Camera.main.transform.InverseTransformDirection(gravityVector.Value);
+                Physics.gravity = localSpace.normalized;
             }
             else
             {
-                //need to fix player gravity some how rootmotion?
-                //player.MovementContext.CurrentState.DisableRootMotion = false;
                 Physics.gravity = new Vector3(0f, -9.8f, 0f);
             }
         }
